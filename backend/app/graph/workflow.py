@@ -1,7 +1,8 @@
 from typing import List, TypedDict
-
 from langgraph.graph import END, StateGraph
-
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command, interrupt
+import uuid
 from app.services.ai_service import (
     call_openai_json,
     generate_repo_analysis,
@@ -317,7 +318,7 @@ def general_agent_node(state: AgentRequestState) -> AgentRequestState:
 
 
 def supervisor_finish_node(state: AgentRequestState) -> AgentRequestState:
-    if not state["workflow_diagram"].strip().startswith("graph"):
+    if not isinstance(state["workflow_diagram"], str) or not state["workflow_diagram"].strip().startswith("graph"):
         state["workflow_diagram"] = """
 graph TD
   A[User Request] --> B[Request Router]
@@ -413,3 +414,332 @@ def run_agent_request_workflow(
     }
 
     return workflow.invoke(initial_state)
+review_checkpointer = InMemorySaver()
+compiled_review_workflows = {}
+
+
+class HumanReviewState(TypedDict):
+    repo_url: str
+    user_request: str
+    important_files: List[dict]
+    api_key: str | None
+    route: str
+    workflow_summary: str
+    workflow_diagram: str
+    agent_steps: List[dict]
+    final_answer: str
+    human_decision: dict
+
+
+def review_router_node(state: HumanReviewState) -> HumanReviewState:
+    state["route"] = "human_review"
+
+    state["agent_steps"].append(
+        {
+            "title": "Request Router",
+            "description": "Detected that this request requires human review.",
+            "status": "done",
+        }
+    )
+
+    return state
+
+
+def pre_review_agent_node(state: HumanReviewState) -> HumanReviewState:
+    file_list = [file["path"] for file in state["important_files"][:5]]
+
+    state["workflow_summary"] = (
+        "The AI prepared a proposed action, but it must be approved by a human before continuing."
+    )
+
+    state["workflow_diagram"] = """
+graph TD
+  A[User Request] --> B[Repo Context Collector]
+  B --> C[Human Review Interrupt]
+  C --> D[Final Response Agent]
+"""
+
+    state["final_answer"] = (
+        "Waiting for human approval before generating the final answer."
+    )
+
+    state["agent_steps"].append(
+        {
+            "title": "Pre-Review Agent",
+            "description": "Collected repository context and prepared an action for human review.",
+            "status": "done",
+        }
+    )
+
+    state["human_decision"] = {
+        "proposed_action": "Continue with repository analysis using the selected important files.",
+        "user_request": state["user_request"],
+        "files_to_review": file_list,
+    }
+
+    return state
+
+
+def real_human_review_node(state: HumanReviewState) -> HumanReviewState:
+    decision = interrupt(
+        {
+            "message": "Human approval required before continuing.",
+            "proposed_action": state["human_decision"]["proposed_action"],
+            "user_request": state["user_request"],
+            "files_to_review": state["human_decision"]["files_to_review"],
+            "options": ["approve", "reject", "edit"],
+        }
+    )
+
+    state["human_decision"] = decision
+
+    return state
+
+
+def final_review_agent_result(
+    state: HumanReviewState,
+    effective_request: str,
+    decision_type: str,
+    feedback: str | None,
+):
+    prompt = f"""
+You are a Final Response Agent in CodeCompass.
+
+Original user request:
+{state["user_request"]}
+
+Effective reviewed instruction:
+{effective_request}
+
+Human decision:
+{decision_type}
+
+Human feedback:
+{feedback or "No additional feedback."}
+
+Repository context:
+{build_repo_context(state["important_files"], 2000)}
+
+Return ONLY valid JSON:
+{{
+  "final_answer": "the final reviewed answer grounded in repository context",
+  "workflow_summary": "brief explanation of how the workflow completed after human review",
+  "workflow_diagram": "Mermaid graph TD diagram"
+}}
+"""
+
+    try:
+        result = call_openai_json(prompt, api_key=state["api_key"])
+    except Exception:
+        result = {}
+
+    return validate_workflow_result(result, state["repo_url"], effective_request)
+
+
+def final_after_review_node(state: HumanReviewState) -> HumanReviewState:
+    decision = state.get("human_decision", {})
+    decision_type = decision.get("decision", "approve")
+    feedback = decision.get("feedback")
+    edited_instruction = (decision.get("edited_instruction") or "").strip()
+
+    if decision_type == "reject":
+        state["final_answer"] = (
+            "The human reviewer rejected the proposed AI action. "
+            f"Feedback: {feedback or 'No feedback provided.'}"
+        )
+
+        state["workflow_summary"] = "The workflow stopped because the human reviewer rejected the action."
+
+        state["workflow_diagram"] = """
+graph TD
+  A[User Request] --> B[Human Review]
+  B --> C[Rejected]
+  C --> D[Workflow Stopped]
+"""
+
+    elif decision_type == "edit":
+        effective_request = edited_instruction or state["user_request"]
+        validated = final_review_agent_result(
+            state,
+            effective_request=effective_request,
+            decision_type=decision_type,
+            feedback=feedback,
+        )
+
+        state["final_answer"] = validated.get(
+            "final_answer",
+            "The workflow resumed after the human reviewer edited the instruction, but no final answer was generated.",
+        )
+        state["workflow_summary"] = validated.get(
+            "workflow_summary",
+            "The workflow resumed after the human reviewer edited the AI instruction.",
+        )
+        state["workflow_diagram"] = validated.get(
+            "workflow_diagram",
+            """
+graph TD
+  A[User Request] --> B[Human Review]
+  B --> C[Edited Instruction]
+  C --> D[Final Response Agent]
+  D --> E[Supervisor Agent]
+""",
+        )
+
+    else:
+        validated = final_review_agent_result(
+            state,
+            effective_request=state["user_request"],
+            decision_type=decision_type,
+            feedback=feedback,
+        )
+
+        state["final_answer"] = validated.get(
+            "final_answer",
+            "The human reviewer approved the proposed action, but no final answer was generated.",
+        )
+        state["workflow_summary"] = validated.get(
+            "workflow_summary",
+            "The workflow resumed after human approval and completed successfully.",
+        )
+        state["workflow_diagram"] = validated.get(
+            "workflow_diagram",
+            """
+graph TD
+  A[User Request] --> B[Human Review]
+  B --> C[Approved]
+  C --> D[Final Response Agent]
+  D --> E[Supervisor Agent]
+""",
+        )
+
+    state["agent_steps"].append(
+        {
+            "title": "Human Review Step",
+            "description": f"Human decision received: {decision_type}.",
+            "status": "done",
+        }
+    )
+
+    state["agent_steps"].append(
+        {
+            "title": "Final Response Agent",
+            "description": "Generated final output after the human review decision.",
+            "status": "done",
+        }
+    )
+
+    state["agent_steps"].append(
+        {
+            "title": "Supervisor Agent",
+            "description": "Confirmed the human-reviewed workflow result.",
+            "status": "done",
+        }
+    )
+
+    return state
+
+
+def build_real_human_review_workflow():
+    graph = StateGraph(HumanReviewState)
+
+    graph.add_node("router", review_router_node)
+    graph.add_node("pre_review", pre_review_agent_node)
+    graph.add_node("human_review", real_human_review_node)
+    graph.add_node("final_after_review", final_after_review_node)
+
+    graph.set_entry_point("router")
+    graph.add_edge("router", "pre_review")
+    graph.add_edge("pre_review", "human_review")
+    graph.add_edge("human_review", "final_after_review")
+    graph.add_edge("final_after_review", END)
+
+    return graph.compile(checkpointer=review_checkpointer)
+
+
+def start_real_human_review_workflow(
+    repo_url: str,
+    user_request: str,
+    important_files: List[dict],
+    api_key: str | None = None,
+):
+    review_id = str(uuid.uuid4())
+    workflow = build_real_human_review_workflow()
+    compiled_review_workflows[review_id] = workflow
+
+    config = {
+        "configurable": {
+            "thread_id": review_id,
+        }
+    }
+
+    initial_state: HumanReviewState = {
+        "repo_url": repo_url,
+        "user_request": user_request,
+        "important_files": important_files,
+        "api_key": api_key,
+        "route": "",
+        "workflow_summary": "",
+        "workflow_diagram": "",
+        "agent_steps": [],
+        "final_answer": "",
+        "human_decision": {},
+    }
+
+    result = workflow.invoke(initial_state, config=config)
+
+    interrupt_payload = None
+
+    if "__interrupt__" in result:
+        interrupt_payload = result["__interrupt__"][0].value
+
+    agent_steps = result.get("agent_steps", []).copy()
+    agent_steps.append(
+        {
+            "title": "Human Review Required",
+            "description": "The LangGraph workflow paused using interrupt() and is waiting for user approval.",
+            "status": "active",
+        }
+    )
+
+    return {
+        "review_id": review_id,
+        "pending_review": True,
+        "review_payload": interrupt_payload,
+        "workflow_summary": "Workflow paused for human review.",
+        "workflow_diagram": """
+graph TD
+  A[User Request] --> B[Pre-Review Agent]
+  B --> C[Human Review Required]
+  C --> D[Waiting for Decision]
+""",
+        "agent_steps": agent_steps,
+        "route": "human_review",
+        "final_answer": "Waiting for human review decision.",
+    }
+
+
+def resume_real_human_review_workflow(review_id: str, decision: dict):
+    workflow = compiled_review_workflows.get(review_id)
+
+    if workflow is None:
+        workflow = build_real_human_review_workflow()
+        compiled_review_workflows[review_id] = workflow
+
+    config = {
+        "configurable": {
+            "thread_id": review_id,
+        }
+    }
+
+    result = workflow.invoke(Command(resume=decision), config=config)
+
+    return {
+        "workflow_summary": result["workflow_summary"],
+        "workflow_diagram": result["workflow_diagram"],
+        "agent_steps": result["agent_steps"],
+        "route": result["route"],
+        "final_answer": result["final_answer"],
+        "pending_review": False,
+        "review_id": review_id,
+        "review_payload": None,
+    }

@@ -17,7 +17,73 @@ import AgentTimeline from "./components/AgentTimeline";
 import DetailPanel from "./components/DetailPanel";
 import StatsCards from "./components/StatsCards";
 import type { FileNode, ProjectAnalysis, WorkflowResult } from "./types";
-import { analyzeRepo, createAgentWorkflow } from "./lib/api";
+import HumanReviewPanel from "./components/HumanReviewPanel";
+import { analyzeRepo, createAgentWorkflow, resumeHumanReview } from "./lib/api";
+import AgentResultPanel from "./components/AgentResultPanel";
+
+function inferWorkflowRoute(request: string) {
+  const normalizedRequest = request.toLowerCase();
+
+  if (
+    normalizedRequest.includes("human") ||
+    normalizedRequest.includes("manual") ||
+    normalizedRequest.includes("review")
+  ) {
+    return "human_review";
+  }
+  if (
+    normalizedRequest.includes("search") ||
+    normalizedRequest.includes("find") ||
+    normalizedRequest.includes("where")
+  ) {
+    return "repo_search";
+  }
+  if (
+    normalizedRequest.includes("issue") ||
+    normalizedRequest.includes("bug") ||
+    normalizedRequest.includes("problem")
+  ) {
+    return "issue_review";
+  }
+  if (
+    normalizedRequest.includes("architecture") ||
+    normalizedRequest.includes("diagram") ||
+    normalizedRequest.includes("structure")
+  ) {
+    return "architecture";
+  }
+
+  return "general";
+}
+
+function getWorkflowLoadingSteps(request: string): WorkflowResult["agentSteps"] {
+  const route = inferWorkflowRoute(request);
+  const routeTitleMap: Record<string, string> = {
+    human_review: "Human Review Agent",
+    repo_search: "Repo Search Agent",
+    issue_review: "Issue Review Agent",
+    architecture: "Architecture Agent",
+    general: "General Fallback Agent",
+  };
+
+  return [
+    {
+      title: "Request Router",
+      description: "Classifying the workflow request and selecting the best specialized route.",
+      status: "done",
+    },
+    {
+      title: routeTitleMap[route],
+      description: "Running the selected LangGraph agent with repository context.",
+      status: "active",
+    },
+    {
+      title: "Supervisor Agent",
+      description: "Reviewing the specialized result and preparing the final answer.",
+      status: "pending",
+    },
+  ];
+}
 
 export default function App() {
   const [apiKey, setApiKey] = useState(
@@ -42,6 +108,14 @@ export default function App() {
 
   const analyzed = analysis !== null;
   const apiKeySaved = apiKey.trim().length > 0;
+  const defaultWorkflowRequest =
+    "Default workflow: scan repository, summarize files, generate architecture diagram, and route output through a supervisor agent.";
+  const activeWorkflowRequest = workflowRequest || defaultWorkflowRequest;
+  const workflowTimelineSteps =
+    workflowResult?.agentSteps ||
+    (isGeneratingWorkflow
+      ? getWorkflowLoadingSteps(activeWorkflowRequest)
+      : analysis?.agentSteps || []);
 
   function isValidGithubUrl(url: string) {
     return /^https:\/\/github\.com\/[^/]+\/[^/]+\/?$/.test(url.trim());
@@ -113,6 +187,7 @@ export default function App() {
     setWorkflowRequest(request.trim());
     setIsGeneratingWorkflow(true);
     setActiveTab("workflow");
+    setWorkflowResult(null);
 
     try {
       const result = await createAgentWorkflow(repoUrl, request, { apiKey });
@@ -121,7 +196,11 @@ export default function App() {
         workflowSummary: result.workflow_summary,
         workflowDiagram: result.workflow_diagram,
         agentSteps: result.agent_steps,
+        route: result.route,
         finalAnswer: result.final_answer,
+        pendingReview: result.pending_review,
+        reviewId: result.review_id,
+        reviewPayload: result.review_payload,
       };
 
       setWorkflowResult(mappedWorkflow);
@@ -131,6 +210,57 @@ export default function App() {
         err instanceof Error
           ? err.message
           : "Failed to create agent workflow.",
+      );
+    } finally {
+      setIsGeneratingWorkflow(false);
+    }
+  }
+
+  async function handleHumanReviewDecision(
+    decision: "approve" | "reject" | "edit",
+    editedInstruction?: string,
+    feedback?: string
+  ) {
+    setWorkflowError("");
+  
+    if (!workflowResult?.reviewId) {
+      setWorkflowError("No pending human review found.");
+      return;
+    }
+
+    if (decision === "edit" && !editedInstruction?.trim()) {
+      setWorkflowError("Please enter an edited instruction before continuing.");
+      return;
+    }
+  
+    setIsGeneratingWorkflow(true);
+  
+    try {
+      const result = await resumeHumanReview({
+        review_id: workflowResult.reviewId,
+        decision,
+        edited_instruction: editedInstruction,
+        feedback,
+      }, { apiKey });
+  
+      const mappedWorkflow: WorkflowResult = {
+        workflowSummary: result.workflow_summary,
+        workflowDiagram: result.workflow_diagram,
+        agentSteps: result.agent_steps,
+        route: result.route,
+        finalAnswer: result.final_answer,
+        pendingReview: result.pending_review,
+        reviewId: result.review_id,
+        reviewPayload: result.review_payload,
+      };
+  
+      setWorkflowResult(mappedWorkflow);
+    } catch (err) {
+      console.warn("Human review resume failed.", err);
+      setWorkflowError(
+        err instanceof Error
+          ? err.message
+          : "Failed to resume human review workflow."
       );
     } finally {
       setIsGeneratingWorkflow(false);
@@ -248,23 +378,50 @@ export default function App() {
             {activeTab === "workflow" && (
               <div className="grid gap-6 xl:grid-cols-12">
                 <div className="space-y-6 xl:col-span-7">
-                  <AgentTimeline
-                    steps={workflowResult?.agentSteps || analysis.agentSteps}
+                  <ErrorAlert
+                    message={workflowError}
+                    onClose={() => setWorkflowError("")}
                   />
 
+                  <AgentResultPanel
+                    result={workflowResult}
+                    request={
+                      workflowRequest ||
+                      "Default workflow: scan repository, summarize files, generate architecture diagram, and route output through a supervisor agent."
+                    }
+                  />
+
+                  <HumanReviewPanel
+                    result={workflowResult}
+                    onDecision={handleHumanReviewDecision}
+                    isSubmitting={isGeneratingWorkflow}
+                  />
+
+                  <AgentTimeline steps={workflowTimelineSteps} />
+
                   {isGeneratingWorkflow ? (
-                    <LoadingSteps />
+                    <LoadingSteps
+                      title="Workflow Execution"
+                      description="LangGraph is routing your request, running a specialized agent, and assembling the final response."
+                      statusLabel="Executing"
+                      steps={[
+                        "Classifying the user request",
+                        "Selecting a specialized route",
+                        "Reading cached repository context",
+                        "Running the selected agent",
+                        "Reviewing output in the supervisor node",
+                        "Preparing the final workflow response",
+                      ]}
+                    />
                   ) : (
                     <WorkflowViewer
-                      request={
-                        workflowRequest ||
-                        "Default workflow: scan repository, summarize files, generate architecture diagram, and route output through a supervisor agent."
-                      }
+                      request={activeWorkflowRequest}
                       summary={workflowResult?.workflowSummary}
                       finalAnswer={workflowResult?.finalAnswer}
-                      diagram={
-                        workflowResult?.workflowDiagram || analysis.repoDiagram
-                      }
+                      route={workflowResult?.route}
+                      stepCount={workflowTimelineSteps.length}
+                      isLoading={isGeneratingWorkflow}
+                      diagram={workflowResult?.workflowDiagram || analysis.repoDiagram}
                     />
                   )}
                 </div>

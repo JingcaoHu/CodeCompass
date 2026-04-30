@@ -438,7 +438,3 @@ This can happen when:
 - The frontend contains its own build tooling and source tree
 - The backend currently stores repository context in memory for follow-up requests
 - The app is optimized for local development and demonstration use rather than production deployment
-
-## License
-
-This project currently does not define a license file in the repository. If you plan to share or deploy it publicly, add a license that matches your intended use.

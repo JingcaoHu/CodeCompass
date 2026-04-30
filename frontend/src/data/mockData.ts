@@ -203,9 +203,10 @@ export const mockProjectAnalysis: ProjectAnalysis = {
 
 export const mockWorkflowResult: WorkflowResult = {
   workflowSummary:
-    "LangGraph will route the user request through a supervisor agent, assign a repo search agent, add a human review step, collect relevant code context, and produce the final response.",
+    "LangGraph routed the request through a Supervisor Agent, selected a specialized Repo Search Agent, collected relevant code context, and prepared a final answer.",
   workflowDiagram,
   agentSteps,
+  route: "repo_search",
   finalAnswer:
-    "This is a mock final answer that summarizes how the routed workflow would respond after reviewing repository context.",
+    "The Repo Search Agent reviewed the important files and found the most relevant code context for the user's request. In the real backend version, this answer is generated from actual repository files.",
 };

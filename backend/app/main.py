@@ -2,8 +2,6 @@ import re
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-
-from app.models import AnalyzeRepoRequest, AnalyzeRepoResponse, AgentRequest, AgentResponse
 from app.services.github_service import (
     clone_github_repo,
     cleanup_repo,
@@ -11,8 +9,20 @@ from app.services.github_service import (
 )
 from app.services.repo_scanner import scan_repo, flatten_files
 from app.services.file_reader import read_important_files
-from app.graph.workflow import run_repo_workflow, run_agent_request_workflow
+from app.graph.workflow import (
+    run_repo_workflow,
+    run_agent_request_workflow,
+    start_real_human_review_workflow,
+    resume_real_human_review_workflow,
+)
 from app.services.repo_context_store import save_repo_context, get_repo_context
+from app.models import (
+    AnalyzeRepoRequest,
+    AnalyzeRepoResponse,
+    AgentRequest,
+    AgentResponse,
+    ReviewDecisionRequest,
+)
 
 load_dotenv()
 
@@ -130,14 +140,26 @@ def agent_request(
 
         if not important_files:
             repo_path = None
-
             try:
                 repo_path = clone_github_repo(request.repo_url)
                 important_files = read_important_files(repo_path)
-                save_repo_context(request.repo_url, important_files)
             finally:
                 if repo_path is not None:
                     cleanup_repo(repo_path)
+
+        request_text = request.user_request.lower()
+
+        if (
+            "human" in request_text
+            or "manual" in request_text
+            or "review" in request_text
+        ):
+            return start_real_human_review_workflow(
+                repo_url=request.repo_url,
+                user_request=request.user_request,
+                important_files=important_files,
+                api_key=x_openai_api_key,
+            )
 
         result = run_agent_request_workflow(
             repo_url=request.repo_url,
@@ -150,7 +172,11 @@ def agent_request(
             "workflow_summary": result["workflow_summary"],
             "workflow_diagram": result["workflow_diagram"],
             "agent_steps": result["agent_steps"],
+            "route": result["route"],
             "final_answer": result["final_answer"],
+            "pending_review": False,
+            "review_id": None,
+            "review_payload": None,
         }
 
     except HTTPException:
@@ -160,4 +186,26 @@ def agent_request(
         raise HTTPException(
             status_code=400,
             detail=f"Workflow generation failed. Reason: {str(error)}",
+        )
+
+@app.post("/resume-review", response_model=AgentResponse)
+def resume_review(
+    request: ReviewDecisionRequest,
+):
+    try:
+        decision_payload = {
+            "decision": request.decision,
+            "edited_instruction": request.edited_instruction,
+            "feedback": request.feedback,
+        }
+
+        return resume_real_human_review_workflow(
+            review_id=request.review_id,
+            decision=decision_payload,
+        )
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to resume human review workflow. Reason: {str(error)}",
         )

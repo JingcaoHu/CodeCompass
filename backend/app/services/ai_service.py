@@ -121,6 +121,12 @@ def validate_repo_result(result: dict, project_name: str, repo_url: str, importa
     result.setdefault("issues", [])
     result.setdefault("repo_diagram", "")
 
+    if not isinstance(result["summary"], str):
+        result["summary"] = ""
+
+    if not isinstance(result["repo_diagram"], str):
+        result["repo_diagram"] = ""
+
     if not result["summary"]:
         result["summary"] = fallback_repo_analysis(project_name, repo_url, important_files)["summary"]
 
@@ -154,6 +160,12 @@ def validate_workflow_result(result: dict, repo_url: str, user_request: str):
     result.setdefault("workflow_diagram", fallback["workflow_diagram"])
     result.setdefault("agent_steps", fallback["agent_steps"])
     result.setdefault("final_answer", fallback["final_answer"])
+
+    if not isinstance(result["workflow_summary"], str):
+        result["workflow_summary"] = fallback["workflow_summary"]
+
+    if not isinstance(result["workflow_diagram"], str):
+        result["workflow_diagram"] = fallback["workflow_diagram"]
 
     if not result["workflow_diagram"].strip().startswith("graph"):
         result["workflow_diagram"] = fallback["workflow_diagram"]

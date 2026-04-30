@@ -31,7 +31,17 @@ export type AgentRequestResponse = {
   workflow_summary: string;
   workflow_diagram: string;
   agent_steps: AgentStep[];
-  final_answer: string;
+  route?: string;
+  final_answer?: string;
+  pending_review?: boolean;
+  review_id?: string | null;
+  review_payload?: {
+    message?: string;
+    proposed_action?: string;
+    user_request?: string;
+    files_to_review?: string[];
+    options?: string[];
+  } | null;
 };
 
 export async function analyzeRepo(
@@ -93,4 +103,30 @@ function buildHeaders(options: RequestOptions) {
   }
 
   return headers;
+}
+
+export type ResumeReviewRequest = {
+  review_id: string;
+  decision: "approve" | "reject" | "edit";
+  edited_instruction?: string;
+  feedback?: string;
+};
+
+export async function resumeHumanReview(
+  payload: ResumeReviewRequest,
+  options: RequestOptions = {}
+): Promise<AgentRequestResponse> {
+  const response = await fetch(`${API_BASE_URL}/resume-review`, {
+    method: "POST",
+    headers: buildHeaders(options),
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      await getErrorMessage(response, "Failed to resume human review workflow.")
+    );
+  }
+
+  return response.json();
 }

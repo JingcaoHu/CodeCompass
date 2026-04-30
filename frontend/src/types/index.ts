@@ -35,9 +35,19 @@ export type FileNode = {
     agentSteps: AgentStep[];
   };
   
-export type WorkflowResult = {
+  export type WorkflowResult = {
     workflowSummary: string;
     workflowDiagram: string;
     agentSteps: AgentStep[];
-    finalAnswer: string;
+    route?: string;
+    finalAnswer?: string;
+    pendingReview?: boolean;
+    reviewId?: string | null;
+    reviewPayload?: {
+      message?: string;
+      proposed_action?: string;
+      user_request?: string;
+      files_to_review?: string[];
+      options?: string[];
+    } | null;
   };

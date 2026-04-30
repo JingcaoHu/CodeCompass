@@ -1,5 +1,12 @@
-from pydantic import BaseModel
 from typing import List, Optional, Literal
+from pydantic import BaseModel
+
+
+class ReviewDecisionRequest(BaseModel):
+    review_id: str
+    decision: Literal["approve", "reject", "edit"]
+    edited_instruction: Optional[str] = None
+    feedback: Optional[str] = None
 
 
 class AnalyzeRepoRequest(BaseModel):
@@ -37,6 +44,17 @@ class AgentStep(BaseModel):
     status: Literal["done", "active", "pending"]
 
 
+class AgentResponse(BaseModel):
+    workflow_summary: str
+    workflow_diagram: str
+    agent_steps: List[AgentStep]
+    route: Optional[str] = None
+    final_answer: Optional[str] = None
+    pending_review: Optional[bool] = False
+    review_id: Optional[str] = None
+    review_payload: Optional[dict] = None
+
+
 class AnalyzeRepoResponse(BaseModel):
     project_name: str
     repo_url: str
@@ -46,13 +64,6 @@ class AnalyzeRepoResponse(BaseModel):
     issues: List[Issue]
     repo_diagram: str
     agent_steps: List[AgentStep]
-
-
-class AgentResponse(BaseModel):
-    workflow_summary: str
-    workflow_diagram: str
-    agent_steps: List[AgentStep]
-    final_answer: str
 
 
 FileNode.model_rebuild()
